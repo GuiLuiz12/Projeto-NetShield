@@ -22,12 +22,15 @@ verify_dependencies() {
     if [ ! -f "/usr/share/nmap/scripts/vulners.nse" ]; then
         echo -e "${AMARELO}[+] Instalando vulners.nse...${NC}"
         sudo wget -q https://github.com/vulnersCom/nmap-vulners/raw/master/vulners.nse -O /usr/share/nmap/scripts/vulners.nse
-        sudo nmap --script-updatedb
+        if ! sudo nmap --script-updatedb; then
+            echo -e "${VERMELHO}[!] Falha ao atualizar banco de dados de scripts NSE${NC}"
+            exit 1
+        fi
     fi
     
     local missing_scripts=()
     [ ! -f "/usr/share/nmap/scripts/http-vulners.nse" ] && missing_scripts+=("http-vulners")
-    [ ! -f "/usr/share/nmap/scripts/sshvuln.nse" ] && missing_scripts+=("sshvuln")
+    [ ! -f "/usr/share/nmap/scripts/ssh-enum-algos.nse" ] && missing_scripts+=("ssh-enum-algos")
     
     if [ ${#missing_scripts[@]} -gt 0 ]; then
         echo -e "${VERMELHO}[!] Scripts opcionais faltando: ${missing_scripts[*]}${NC}"
@@ -38,14 +41,19 @@ verify_dependencies() {
             for script in "${missing_scripts[@]}"; do
                 case $script in
                     "http-vulners")
-                        sudo wget -q https://raw.githubusercontent.com/psychomuggins/nmap-nse-scripts/master/http-vulners.nse -O /usr/share/nmap/scripts/http-vulners.nse
+                        echo -e "${AMARELO}[+] Instalando http-vulners.nse...${NC}"
+                        sudo wget -q https://raw.githubusercontent.com/scipag/vulscan/master/http-vulners-regex.nse -O /usr/share/nmap/scripts/http-vulners.nse
                         ;;
-                    "sshvuln")
-                        sudo wget -q https://raw.githubusercontent.com/cldrn/nmap-nse-scripts/master/ssh2-enum-algos.nse -O /usr/share/nmap/scripts/ssh-enum-algos.nse
+                    "ssh-enum-algos")
+                        echo -e "${AMARELO}[+] Instalando ssh-enum-algos.nse...${NC}"
+                        sudo wget -q https://raw.githubusercontent.com/scipag/vulscan/master/ssh-vulners.nse -O /usr/share/nmap/scripts/ssh-enum-algos.nse
                         ;;
                 esac
             done
-            sudo nmap --script-updatedb
+            if ! sudo nmap --script-updatedb; then
+                echo -e "${VERMELHO}[!] Falha ao atualizar banco de dados de scripts NSE${NC}"
+                exit 1
+            fi
         fi
     fi
 }
@@ -54,6 +62,11 @@ generate_json_report() {
     local IP=$1
     local RELATORIO_JSON="$DIR_RELATORIOS/scan_${IP}_${DATA_HORA}.json"
     local TMP_FILE="$DIR_RELATORIOS/scan_${IP}_${DATA_HORA}.txt.tmp"
+
+    if [ ! -f "$TMP_FILE" ]; then
+        echo -e "${VERMELHO}[!] Arquivo temporário não encontrado: $TMP_FILE${NC}"
+        return 1
+    fi
 
     echo -e "${AMARELO}[DEBUG] Analisando arquivo temporário para $IP...${NC}"
     grep -E "(open|CVE-)" "$TMP_FILE" | head -n 20 | while read -r line; do
@@ -110,11 +123,14 @@ generate_json_report() {
         echo -e "${VERMELHO}[!] JSON inválido gerado, criando fallback${NC}" >&2
         echo "{\"error\": \"Falha ao gerar JSON\", \"ip\": \"$IP\", \"raw_file\": \"$TMP_FILE\"}" > "$RELATORIO_JSON"
     fi
+    
+    echo -e "${VERDE}[+] Relatório JSON salvo: $RELATORIO_JSON${NC}"
 }
 
 scan_ip() {
     local IP=$1
     local RELATORIO="$DIR_RELATORIOS/scan_${IP}_${DATA_HORA}.txt"
+    local TMP_FILE="$RELATORIO.tmp"
     local SCAN_CMD="sudo nmap -sV --script vulners --script-args mincvss=5.0"
     
     echo "=== RELATÓRIO DE VULNERABILIDADES ===" > "$RELATORIO"
@@ -127,35 +143,37 @@ scan_ip() {
     
     SCAN_CMD+=" -T4 --top-ports 1000 $IP"
     echo -e "${AZUL}[*] Executando scan em $IP...${NC}"
-    $SCAN_CMD -oN "$RELATORIO.tmp" 2>/dev/null
+    $SCAN_CMD -oN "$TMP_FILE" 2>/dev/null
     
-    if grep -q -E "open.*(http|ssl|ssh|rdp|ftp|smtp)" "$RELATORIO.tmp"; then
+    if grep -q -E "open.*(http|ssl|ssh|rdp|ftp|smtp)" "$TMP_FILE"; then
         echo -e "${AZUL}[*] Serviços críticos detectados, scan completo...${NC}"
-        sudo nmap -sV --script "vulners and safe" -p- --min-rate 5000 "$IP" -oN "$RELATORIO.tmp.full"
-        cat "$RELATORIO.tmp.full" >> "$RELATORIO.tmp"
-        rm -f "$RELATORIO.tmp.full"
+        sudo nmap -sV --script "vulners and safe" -p- --min-rate 5000 "$IP" -oN "$TMP_FILE.full" 2>/dev/null
+        cat "$TMP_FILE.full" >> "$TMP_FILE"
+        rm -f "$TMP_FILE.full"
     fi
     
-    process_results "$IP" "$RELATORIO"
+    process_results "$IP" "$RELATORIO" "$TMP_FILE"
     generate_json_report "$IP"
+    
+    rm -f "$TMP_FILE"
 }
 
 process_results() {
     local IP=$1
     local RELATORIO=$2
+    local TMP_FILE=$3
     
     echo -e "\n[PORTAS ABERTAS]" >> "$RELATORIO"
-    grep -E "[0-9]+/(tcp|udp).*open" "$RELATORIO.tmp" | awk '{print $1,$3,$4,$5}' >> "$RELATORIO"
+    grep -E "[0-9]+/(tcp|udp).*open" "$TMP_FILE" | awk '{print $1,$3,$4,$5}' >> "$RELATORIO"
     
     echo -e "\n[CVEs ENCONTRADOS]" >> "$RELATORIO"
-    if grep -q -E "CVE-[0-9]{4}-[0-9]+" "$RELATORIO.tmp"; then
-        grep -E "CVE-[0-9]{4}-[0-9]+" "$RELATORIO.tmp" | sort | uniq >> "$RELATORIO"
+    if grep -q -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE"; then
+        grep -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE" | sort | uniq >> "$RELATORIO"
     else
         echo "Nenhum CVE crítico encontrado (CVSS >= 5.0)." >> "$RELATORIO"
     fi
     
-    generate_recommendations "$RELATORIO" "$RELATORIO.tmp"
-    rm -f "$RELATORIO.tmp"
+    generate_recommendations "$RELATORIO" "$TMP_FILE"
     echo -e "${VERDE}[+] Relatório TXT salvo: $RELATORIO${NC}"
 }
 
