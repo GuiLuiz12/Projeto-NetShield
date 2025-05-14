@@ -1,0 +1,37 @@
+from flask import Flask, render_template, jsonify
+from scanner.database import DatabaseManager
+import logging
+
+def create_app():
+    app = Flask(__name__)
+    db = DatabaseManager()
+
+    @app.route('/')
+    def dashboard():
+        hosts = db.get_hosts()
+        return render_template('dashboard.html', hosts=hosts)
+
+    @app.route('/host/<ip>')
+    def host_details(ip):
+        host = db.get_host_details(ip)
+        if not host:
+            return "Host not found", 404
+        return render_template('host_details.html', host=host)
+
+    @app.route('/api/hosts')
+    def api_hosts():
+        hosts = db.get_hosts()
+        return jsonify(hosts)
+
+    @app.route('/api/host/<ip>')
+    def api_host(ip):
+        host = db.get_host_details(ip)
+        if not host:
+            return jsonify({"error": "Host not found"}), 404
+        return jsonify(host)
+
+    return app
+
+if __name__ == '__main__':
+    app = create_app()
+    app.run(debug=True)
