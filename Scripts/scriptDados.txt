@@ -97,20 +97,40 @@ generate_json_report() {
     
     echo "\"cves\": [" >> "$RELATORIO_JSON"
     if grep -q -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE"; then
+        # Extração robusta de CVEs com IDs únicos
         grep -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE" | awk '{
-            cve = $1;
-            cvss = "0.0";
-            desc = $0;
-            
-            if (match(desc, /[0-9]+\.[0-9]/)) {
-                cvss = substr(desc, RSTART, RLENGTH);
-                desc = substr(desc, RSTART + RLENGTH + 1);
+            # Extrai o ID do CVE (primeiro campo que corresponde ao padrão CVE)
+            cve_id = "";
+            if (match($0, /(CVE-[0-9]{4}-[0-9]+)/)) {
+                cve_id = substr($0, RSTART, RLENGTH);
+                $0 = substr($0, RSTART + RLENGTH);
             }
             
+            # Extrai o CVSS score se existir
+            cvss = "0.0";
+            if (match($0, /[0-9]+\.[0-9]/)) {
+                cvss = substr($0, RSTART, RLENGTH);
+                $0 = substr($0, RSTART + RLENGTH);
+            }
+            
+            # O restante é a descrição
+            desc = $0;
+            
+            # Limpeza dos campos
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc);
             gsub(/"/, "\\\"", desc);
             gsub(/\\/, "", desc);
-            printf "{\"id\": \"%s\", \"cvss\": %s, \"description\": \"%s\"},\n", 
-            cve, cvss, desc
+            
+            # Se não encontrou CVE_ID, tenta extrair da descrição
+            if (cve_id == "" && match(desc, /(CVE-[0-9]{4}-[0-9]+)/)) {
+                cve_id = substr(desc, RSTART, RLENGTH);
+            }
+            
+            # Garante que temos um ID válido
+            if (cve_id != "") {
+                printf "{\"id\": \"%s\", \"cvss\": %s, \"description\": \"%s\"},\n", 
+                cve_id, cvss, desc
+            }
         }' | sed '$ s/,$//' >> "$RELATORIO_JSON"
     else
         echo -e "${VERMELHO}[!] Nenhum CVE detectado no arquivo${NC}" >&2
