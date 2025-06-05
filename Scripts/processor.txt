@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import json
 import glob
 import sqlite3
@@ -8,7 +6,7 @@ import os
 import logging
 import sys
 import re
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple  # Adicionando Tuple aqui
 
 # Configuração de logging
 logging.basicConfig(
@@ -26,6 +24,7 @@ class DatabaseManager:
     def __init__(self, db_name: str = 'vulnerabilities.db'):
         self.db_name = db_name
         self.conn = None
+        self.table_prefixes = set()  # Armazena apenas os prefixos das tabelas
 
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_name)
@@ -40,106 +39,112 @@ class DatabaseManager:
                 self.conn.rollback()
             self.conn.close()
 
-    def setup_database(self):
-        """Configura a estrutura do banco de dados"""
+    def _format_date(self, date_str: str, ip: str) -> str:
+        """Formata a data e IP para YYMMDD_IP"""
+        try:
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            date_part = dt.strftime("%y%m%d")  # Formato: YYMMDD
+            ip_part = ip.replace('.', '_')     # Formato: 192_168_1_1
+            return f"{date_part}_{ip_part}"
+        except:
+            # Fallback seguro
+            clean_date = date_str[:10].replace('-', '')
+            clean_ip = ip.replace('.', '_')
+            return f"{clean_date}_{clean_ip}"
+
+    def create_scan_tables(self, scan_date: str, ip: str) -> Dict[str, str]:
+        """Cria tabelas para uma data e IP específicos e retorna os nomes"""
+        table_prefix = self._format_date(scan_date, ip)
+        self.table_prefixes.add(table_prefix)  # Armazena apenas o prefixo
+        
+        table_names = {
+            'hosts': f"scan_{table_prefix}_hosts",
+            'ports': f"scan_{table_prefix}_ports",
+            'vulns': f"scan_{table_prefix}_vulns",
+            'recom': f"scan_{table_prefix}_recom"
+        }
+
         try:
             cursor = self.conn.cursor()
             
-            # Verifica se as tabelas já existem
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='hosts'")
-            if cursor.fetchone():
-                logger.info("Tabelas já existem. Verificando estrutura...")
-                self._verify_schema()
-                return
-            
-            # Criação das tabelas
-            tables = [
-                '''CREATE TABLE hosts (
+            # Cria tabela de hosts
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['hosts']} (
                     ip TEXT PRIMARY KEY, 
                     scan_date TEXT NOT NULL, 
                     network TEXT DEFAULT '',
                     risk_score REAL DEFAULT 0.0,
                     last_updated TEXT DEFAULT CURRENT_TIMESTAMP
-                )''',
-                
-                '''CREATE TABLE ports (
+                )
+            ''')
+            
+            # Cria tabela de portas
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['ports']} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     host_ip TEXT NOT NULL, 
                     port INTEGER NOT NULL, 
                     protocol TEXT NOT NULL, 
                     service TEXT DEFAULT '', 
                     version TEXT DEFAULT '',
-                    FOREIGN KEY(host_ip) REFERENCES hosts(ip) ON DELETE CASCADE,
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE,
                     UNIQUE(host_ip, port, protocol)
-                )''',
-                
-                '''CREATE TABLE vulnerabilities (
+                )
+            ''')
+            
+            # Cria tabela de vulnerabilidades
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['vulns']} (
                     id TEXT PRIMARY KEY,
                     host_ip TEXT NOT NULL,
                     cvss REAL NOT NULL,
                     description TEXT DEFAULT '',
-                    FOREIGN KEY(host_ip) REFERENCES hosts(ip) ON DELETE CASCADE
-                )''',
-                
-                '''CREATE TABLE recommendations (
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Cria tabela de recomendações
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['recom']} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     host_ip TEXT NOT NULL,
                     recommendation TEXT NOT NULL,
-                    FOREIGN KEY(host_ip) REFERENCES hosts(ip) ON DELETE CASCADE
-                )''',
-                
-                '''CREATE INDEX idx_vulnerabilities_host ON vulnerabilities(host_ip)''',
-                '''CREATE INDEX idx_ports_host ON ports(host_ip)''',
-                '''CREATE INDEX idx_recommendations_host ON recommendations(host_ip)'''
-            ]
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE
+                )
+            ''')
             
-            for table in tables:
-                cursor.execute(table)
+            # Cria índices
+            cursor.execute(f'''
+                CREATE INDEX IF NOT EXISTS idx_{table_prefix}_vuln_host 
+                ON {table_names['vulns']}(host_ip)
+            ''')
+            cursor.execute(f'''
+                CREATE INDEX IF NOT EXISTS idx_{table_prefix}_ports_host 
+                ON {table_names['ports']}(host_ip)
+            ''')
             
-            logger.info("Banco de dados configurado com sucesso")
+            # Log reduzido apenas para o primeiro IP
+            if len(self.table_prefixes) == 1:
+                logger.info(f"Modelo de tabelas criado. Prefixo: scan_[DATA_IP]_[tipo]")
+            
+            return table_names
             
         except sqlite3.Error as e:
-            logger.error(f"Erro ao configurar o banco de dados: {str(e)}")
+            logger.error(f"Erro ao criar tabelas: {str(e)}")
             raise
 
-    def _verify_schema(self):
-        """Verifica se a estrutura do banco está correta"""
-        schema_expected = {
-            'hosts': [
-                ('ip', 'TEXT', 1, None, 1),
-                ('scan_date', 'TEXT', 1, None, 0),
-                ('network', 'TEXT', 0, "''", 0),
-                ('risk_score', 'REAL', 0, '0.0', 0),
-                ('last_updated', 'TEXT', 0, 'CURRENT_TIMESTAMP', 0)
-            ],
-            'vulnerabilities': [
-                ('id', 'TEXT', 1, None, 1),
-                ('host_ip', 'TEXT', 1, None, 0),
-                ('cvss', 'REAL', 1, None, 0),
-                ('description', 'TEXT', 0, "''", 0)
-            ]
-        }
-        
-        cursor = self.conn.cursor()
-        for table, columns in schema_expected.items():
-            cursor.execute(f"PRAGMA table_info({table})")
-            existing_columns = cursor.fetchall()
-            
-            if len(existing_columns) != len(columns):
-                raise sqlite3.OperationalError(f"A tabela {table} tem estrutura incompatível")
+# ... (restante do código permanece igual) ...
 
-def calculate_risk_score(cves: List[Dict[str, Any]]) -> float:
-    """Calcula o score de risco baseado no CVSS mais alto encontrado"""
-    if not cves:
-        return 0.0
+def get_latest_reports_dir() -> Optional[str]:
+    """Encontra o diretório mais recente de relatórios"""
+    dirs = glob.glob('relatorios_scan_*')
+    if not dirs:
+        logger.error("Nenhum diretório de relatórios encontrado")
+        return None
     
-    try:
-        # Pega o CVSS mais alto em vez da média
-        max_cvss = max(float(cve.get('cvss', 0)) for cve in cves)
-        return min(max_cvss * 1.2, 10.0)  # Aumenta em 20% (máx 10.0)
-    except (TypeError, ValueError) as e:
-        logger.warning(f"Erro ao calcular risk_score: {str(e)}")
-        return 0.0
+    latest_dir = max(dirs, key=os.path.getmtime)
+    logger.info(f"Usando diretório mais recente: {latest_dir}")
+    return latest_dir
 
 def parse_report_file(file_path: str) -> Optional[Dict[str, Any]]:
     """Processa um arquivo de relatório individual"""
@@ -153,25 +158,20 @@ def parse_report_file(file_path: str) -> Optional[Dict[str, Any]]:
                 logger.warning(f"Arquivo {file_path} inválido. Campos faltando: {missing}")
                 return None
                 
-            # Validação e correção de CVEs
             if 'cves' in data:
                 valid_cves = []
                 for i, cve in enumerate(data['cves']):
                     if not isinstance(cve, dict):
                         continue
                         
-                    # Se o ID estiver inválido, tenta extrair da descrição ou gera um único
                     cve_id = cve.get('id', '')
                     if not cve_id or cve_id == '|':
-                        # Tenta extrair CVE da descrição
                         match = re.search(r'(CVE-\d{4}-\d+)', cve.get('description', ''))
                         if match:
                             cve_id = match.group(1)
                         else:
-                            # Gera um ID único como fallback
                             cve_id = f"{data['ip']}_vuln_{i}"
                     
-                    # Garante que o CVSS é um número
                     try:
                         cvss = float(cve.get('cvss', 0))
                     except (TypeError, ValueError):
@@ -197,201 +197,146 @@ def parse_report_file(file_path: str) -> Optional[Dict[str, Any]]:
     
     return None
 
-def import_reports(db_manager: DatabaseManager, directory: str) -> bool:
-    """Importa todos os relatórios de um diretório para o banco de dados"""
+def calculate_risk_score(cves: List[Dict[str, Any]]) -> float:
+    """Calcula o score de risco baseado no CVSS mais alto encontrado"""
+    if not cves:
+        return 0.0
+    
+    try:
+        max_cvss = max(float(cve.get('cvss', 0)) for cve in cves)
+        return min(max_cvss * 1.2, 10.0)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Erro ao calcular risk_score: {str(e)}")
+        return 0.0
+
+def import_report_to_tables(db_manager: DatabaseManager, data: Dict[str, Any], table_names: Dict[str, str]) -> bool:
+    """Importa um relatório para as tabelas especificadas"""
+    ip = data['ip']
+    scan_date = data['date']
+    network = data.get('network', '')
+    
+    try:
+        cursor = db_manager.conn.cursor()
+        
+        # Calcula risk_score
+        risk_score = calculate_risk_score(data.get('cves', []))
+        
+        # Insere host
+        cursor.execute(f'''
+            INSERT OR REPLACE INTO {table_names['hosts']} 
+            (ip, scan_date, network, risk_score) 
+            VALUES (?, ?, ?, ?)
+        ''', (ip, scan_date, network, risk_score))
+        
+        # Insere portas
+        for port in data.get('open_ports', []):
+            cursor.execute(f'''
+                INSERT OR IGNORE INTO {table_names['ports']} 
+                (host_ip, port, protocol, service, version) 
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                ip,
+                port.get('port'),
+                port.get('protocol', 'tcp'),
+                port.get('service', ''),
+                port.get('version', '')
+            ))
+        
+        # Insere vulnerabilidades
+        for cve in data.get('cves', []):
+            cve_id = cve.get('id')
+            if not cve_id:
+                continue
+                
+            cursor.execute(f'''
+                INSERT OR REPLACE INTO {table_names['vulns']} 
+                (id, host_ip, cvss, description) 
+                VALUES (?, ?, ?, ?)
+            ''', (
+                cve_id,
+                ip,
+                cve.get('cvss', 0.0),
+                cve.get('description', '')
+            ))
+        
+        # Insere recomendações padrão
+        recommendations = [
+            "Atualizar todos os serviços listados",
+            "Fechar portas não utilizadas",
+            "Implementar regras de firewall específicas"
+        ]
+        
+        for rec in recommendations:
+            cursor.execute(f'''
+                INSERT OR IGNORE INTO {table_names['recom']} 
+                (host_ip, recommendation) 
+                VALUES (?, ?)
+            ''', (ip, rec))
+        
+        return True
+            
+    except sqlite3.Error as e:
+        logger.error(f"Erro SQL ao importar dados: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erro inesperado ao importar dados: {str(e)}")
+    
+    return False
+
+def process_reports(db_manager: DatabaseManager, directory: str) -> Tuple[bool, List[str]]:
+    """Processa todos os relatórios em um diretório"""
     if not os.path.isdir(directory):
         logger.error(f"Diretório não encontrado: {directory}")
-        return False
+        return False, []
     
     reports = glob.glob(os.path.join(directory, 'scan_*_*.json'))
-    logger.info(f"Encontrados {len(reports)} relatórios em {directory}")
-    
     if not reports:
         logger.warning("Nenhum relatório encontrado")
-        return False
+        return False, []
     
-    imported_count = 0
-    
+    imported = 0
     for report in reports:
-        logger.info(f"Processando: {os.path.basename(report)}")
         data = parse_report_file(report)
         if not data:
             continue
             
-        ip = data['ip']
-        scan_date = data['date']
-        network = data.get('network', '')
+        table_names = db_manager.create_scan_tables(data['date'], data['ip'])
         
-        try:
-            with db_manager.conn:
-                cursor = db_manager.conn.cursor()
-                
-                # Calcula risk_score baseado nas vulnerabilidades
-                risk_score = calculate_risk_score(data.get('cves', []))
-                
-                # Inserir host
-                cursor.execute('''
-                    INSERT OR REPLACE INTO hosts 
-                    (ip, scan_date, network, risk_score) 
-                    VALUES (?, ?, ?, ?)
-                ''', (ip, scan_date, network, risk_score))
-                
-                # Inserir portas
-                port_count = 0
-                for port in data.get('open_ports', []):
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO ports 
-                        (host_ip, port, protocol, service, version) 
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (
-                        ip,
-                        port.get('port'),
-                        port.get('protocol', 'tcp'),
-                        port.get('service', ''),
-                        port.get('version', '')
-                    ))
-                    port_count += 1
-                
-                # Inserir vulnerabilidades com IDs únicos
-                vuln_count = 0
-                for cve in data.get('cves', []):
-                    cve_id = cve.get('id')
-                    if not cve_id:
-                        continue  # Pula CVEs sem ID
-                        
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO vulnerabilities 
-                        (id, host_ip, cvss, description) 
-                        VALUES (?, ?, ?, ?)
-                    ''', (
-                        cve_id,
-                        ip,
-                        cve.get('cvss', 0.0),
-                        cve.get('description', '')
-                    ))
-                    vuln_count += 1
-                
-                imported_count += 1
-                logger.info(f"Processado: {ip} | Portas: {port_count} | Vulnerabilidades: {vuln_count} | Risk Score: {risk_score:.1f}")
-                
-        except sqlite3.Error as e:
-            logger.error(f"Erro SQL em {report}: {str(e)}")
-        except Exception as e:
-            logger.error(f"Erro inesperado em {report}: {str(e)}")
+        if import_report_to_tables(db_manager, data, table_names):
+            imported += 1
     
-    logger.info(f"Importação concluída: {imported_count}/{len(reports)} relatórios processados")
-    return imported_count > 0
-
-def import_single_file(db_manager: DatabaseManager, file_path: str) -> bool:
-    """Processa um único arquivo de relatório"""
-    if not os.path.isfile(file_path):
-        logger.error(f"Arquivo não encontrado: {file_path}")
-        return False
+    success = imported > 0
+    created_prefixes = sorted(db_manager.table_prefixes)
     
-    data = parse_report_file(file_path)
-    if not data:
-        return False
-    
-    try:
-        with db_manager.conn:
-            cursor = db_manager.conn.cursor()
-            
-            ip = data['ip']
-            scan_date = data['date']
-            network = data.get('network', '')
-            risk_score = calculate_risk_score(data.get('cves', []))
-            
-            # Inserir host
-            cursor.execute('''
-                INSERT OR REPLACE INTO hosts 
-                (ip, scan_date, network, risk_score) 
-                VALUES (?, ?, ?, ?)
-            ''', (ip, scan_date, network, risk_score))
-            
-            # Inserir portas
-            port_count = 0
-            for port in data.get('open_ports', []):
-                cursor.execute('''
-                    INSERT OR IGNORE INTO ports 
-                    (host_ip, port, protocol, service, version) 
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    ip,
-                    port.get('port'),
-                    port.get('protocol', 'tcp'),
-                    port.get('service', ''),
-                    port.get('version', '')
-                ))
-                port_count += 1
-            
-            # Inserir vulnerabilidades com IDs únicos
-            vuln_count = 0
-            for cve in data.get('cves', []):
-                cve_id = cve.get('id')
-                if not cve_id:
-                    continue  # Pula CVEs sem ID
-                    
-                cursor.execute('''
-                    INSERT OR REPLACE INTO vulnerabilities 
-                    (id, host_ip, cvss, description) 
-                    VALUES (?, ?, ?, ?)
-                ''', (
-                    cve_id,
-                    ip,
-                    cve.get('cvss', 0.0),
-                    cve.get('description', '')
-                ))
-                vuln_count += 1
-            
-            logger.info(f"Arquivo processado: {ip} | Portas: {port_count} | Vulnerabilidades: {vuln_count} | Risk Score: {risk_score:.1f}")
-            return True
-            
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados: {str(e)}")
-    except Exception as e:
-        logger.error(f"Erro inesperado: {str(e)}")
-    
-    return False
-
-def get_latest_reports_dir() -> Optional[str]:
-    """Encontra o diretório mais recente de relatórios"""
-    dirs = glob.glob('relatorios_scan_*')
-    if not dirs:
-        logger.error("Nenhum diretório de relatórios encontrado")
-        return None
-    
-    latest_dir = max(dirs, key=os.path.getmtime)
-    logger.info(f"Usando diretório mais recente: {latest_dir}")
-    return latest_dir
+    logger.info(f"Processamento concluído. Scans realizados: {len(created_prefixes)}")
+    return success, created_prefixes
 
 def main():
     try:
         logger.info("Iniciando processamento de relatórios")
         
         with DatabaseManager() as db_manager:
-            db_manager.setup_database()
-            
-            # Verificação da estrutura da tabela
-            cursor = db_manager.conn.cursor()
-            cursor.execute("PRAGMA table_info(vulnerabilities)")
-            logger.info("Estrutura da tabela vulnerabilities:")
-            for col in cursor.fetchall():
-                logger.info(f"Coluna {col[0]}: {col[1]} (Tipo: {col[2]})")
-            
             if len(sys.argv) > 1:
-                # Modo arquivo único
-                file_path = sys.argv[1]
-                if not import_single_file(db_manager, file_path):
-                    return 1
+                directory = sys.argv[1]
             else:
-                # Modo diretório automático
-                reports_dir = get_latest_reports_dir()
-                if not reports_dir or not import_reports(db_manager, reports_dir):
+                directory = get_latest_reports_dir()
+                if not directory:
                     return 1
-        
-        logger.info("Processamento concluído com sucesso")
-        return 0
-        
+                
+            success, created_prefixes = process_reports(db_manager, directory)
+            
+            # Saída simplificada
+            print("\nRadicais das tabelas criadas (scan_[DATA_IP]_*):")
+            for prefix in created_prefixes:
+                print(f"- {prefix}")
+            
+            print("\nExemplo de consulta:")
+            if created_prefixes:
+                example = created_prefixes[0]
+                print(f"SELECT * FROM scan_{example}_hosts;")
+                print(f"SELECT * FROM scan_{example}_vulns ORDER BY cvss DESC;")
+            
+            return 0 if success else 1
+            
     except Exception as e:
         logger.critical(f"Erro fatal: {str(e)}", exc_info=True)
         return 1

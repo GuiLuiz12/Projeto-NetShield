@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Cores para feedback
+VERDE='\033[0;32m'
+AMARELO='\033[1;33m'
+VERMELHO='\033[0;31m'
+NC='\033[0m'
+
+echo -e "${AMARELO}[*] Atualizando pacotes...${NC}"
+sudo apt update -y && sudo apt upgrade -y
+
+echo -e "${AMARELO}[*] Instalando Java (OpenJDK 11)...${NC}"
+sudo apt install -y openjdk-11-jre wget unzip
+
+echo -e "${AMARELO}[*] Criando diretório para o Metabase...${NC}"
+mkdir -p ~/metabase
+cd ~/metabase
+
+echo -e "${AMARELO}[*] Baixando o Metabase...${NC}"
+wget -q https://downloads.metabase.com/v0.49.12/metabase.jar -O metabase.jar
+
+echo -e "${AMARELO}[*] Iniciando o Metabase na porta 3000...${NC}"
+nohup java -jar metabase.jar > metabase.log 2>&1 &
+
+echo -e "${VERDE}[+] Metabase está rodando em segundo plano na porta 3000.${NC}"
+echo -e "${VERDE}[+] Acesse com: http://localhost:3000${NC}"
+echo -e "${VERDE}[+] Log de execução: ~/metabase/metabase.log${NC}"
