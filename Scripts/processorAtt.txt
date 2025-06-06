@@ -1,0 +1,561 @@
+import json
+import glob
+import sqlite3
+from datetime import datetime
+import os
+import logging
+import re
+import sys
+from typing import Optional, Dict, List, Any, Tuple
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('processor.log', mode='w'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class DatabaseManager:
+    """Classe para gerenciar todas as operações do banco de dados"""
+    def __init__(self, db_name: str = 'vulnerabilities.db'):
+        self.db_name = db_name
+        self.conn = None
+        self.table_prefixes = set()
+
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.db_name)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            self.conn.close()
+
+    def _format_date(self, date_str: str, ip: str) -> str:
+        """Formata a data e IP para YYMMDD_IP. Mais robusto para ISO ou outros formatos."""
+        try:
+            # Tenta converter de ISO 8601 (com ou sem timezone)
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            date_part = dt.strftime("%y%m%d")
+            ip_part = ip.replace('.', '_')
+            return f"{date_part}_{ip_part}"
+        except ValueError:
+            # Fallback para outros formatos comuns (YYYY-MM-DDTHH:MM, YYYYMMDD_HHMM)
+            match_date_time = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})', date_str)
+            if match_date_time:
+                dt = datetime.strptime(match_date_time.group(1), "%Y-%m-%dT%H:%M")
+                date_part = dt.strftime("%y%m%d")
+            else:
+                # Se não for ISO, tenta como YYYYMMDD_HHMM ou apenas YYYYMMDD
+                clean_date = date_str[:10].replace('-', '').replace('_', '')
+                date_part = clean_date
+            
+            clean_ip = ip.replace('.', '_')
+            return f"{date_part}_{clean_ip}"
+
+
+    def create_scan_tables(self, scan_date: str, ip: str) -> Dict[str, str]:
+        """Cria tabelas para uma data e IP específicos e retorna os nomes"""
+        table_prefix = self._format_date(scan_date, ip)
+        self.table_prefixes.add(table_prefix)
+        
+        table_names = {
+            'hosts': f"scan_{table_prefix}_hosts",
+            'ports': f"scan_{table_prefix}_ports",
+            'vulns': f"scan_{table_prefix}_vulns",
+            'recom': f"scan_{table_prefix}_recom",
+            'http_details': f"scan_{table_prefix}_http_details",
+            # REMOVIDO: 'ssh_keys'
+            # 'ssh_keys': f"scan_{table_prefix}_ssh_keys"
+        }
+
+        try:
+            cursor = self.conn.cursor()
+            
+            # Cria tabela de hosts (ADICIONANDO OS_DETAILS E PERFORMANCE_LATENCY_MS)
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['hosts']} (
+                    ip TEXT PRIMARY KEY, 
+                    scan_date TEXT NOT NULL, 
+                    network TEXT DEFAULT '',
+                    risk_score REAL DEFAULT 0.0,
+                    os_details TEXT DEFAULT '',
+                    performance_latency_ms REAL DEFAULT 0.0,
+                    last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Cria tabela de portas (ADICIONANDO service_version_full)
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['ports']} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_ip TEXT NOT NULL, 
+                    port INTEGER NOT NULL, 
+                    protocol TEXT NOT NULL, 
+                    service TEXT DEFAULT '', 
+                    version TEXT DEFAULT '',
+                    service_version_full TEXT DEFAULT '',
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE,
+                    UNIQUE(host_ip, port, protocol)
+                )
+            ''')
+            
+            # Cria tabela de vulnerabilidades
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['vulns']} (
+                    id TEXT PRIMARY KEY,
+                    host_ip TEXT NOT NULL,
+                    cvss REAL NOT NULL,
+                    description TEXT DEFAULT '',
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Cria tabela de recomendações
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['recom']} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_ip TEXT NOT NULL,
+                    recommendation TEXT NOT NULL,
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE
+                )
+            ''')
+
+            # NOVO: Tabela para Detalhes HTTP
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {table_names['http_details']} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    title TEXT DEFAULT '',
+                    path TEXT DEFAULT '',
+                    status TEXT DEFAULT '',
+                    FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE,
+                    UNIQUE(host_ip, port, path) ON CONFLICT REPLACE
+                )
+            ''')
+
+            # REMOVIDO: Tabela para Chaves SSH
+            # cursor.execute(f'''
+            #     CREATE TABLE IF NOT EXISTS {table_names['ssh_keys']} (
+            #         id INTEGER PRIMARY KEY AUTOINCREMENT,
+            #         host_ip TEXT NOT NULL,
+            #         key_type TEXT NOT NULL,
+            #         fingerprint TEXT NOT NULL,
+            #         FOREIGN KEY(host_ip) REFERENCES {table_names['hosts']}(ip) ON DELETE CASCADE,
+            #         UNIQUE(host_ip, key_type, fingerprint)
+            #     )
+            # ''')
+            
+            # Cria índices
+            cursor.execute(f'''
+                CREATE INDEX IF NOT EXISTS idx_{table_prefix}_vuln_host 
+                ON {table_names['vulns']}(host_ip)
+            ''')
+            cursor.execute(f'''
+                CREATE INDEX IF NOT EXISTS idx_{table_prefix}_ports_host 
+                ON {table_names['ports']}(host_ip)
+            ''')
+            cursor.execute(f'''
+                CREATE INDEX IF NOT EXISTS idx_{table_prefix}_http_host_port
+                ON {table_names['http_details']}(host_ip, port)
+            ''')
+            # REMOVIDO: Índice para SSH Keys
+            # cursor.execute(f'''
+            #     CREATE INDEX IF NOT EXISTS idx_{table_prefix}_ssh_host
+            #     ON {table_names['ssh_keys']}(host_ip)
+            # ''')
+            
+            if len(self.table_prefixes) == 1:
+                logger.info(f"Modelo de tabelas criado. Prefixo: scan_[DATA_IP]_[tipo]")
+            
+            return table_names
+            
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao criar tabelas: {str(e)}")
+            raise
+
+def parse_nmap_output_to_json(nmap_output_path: str, ip: str, network: str, date_scan: str) -> Optional[Dict[str, Any]]:
+    """
+    Parses the raw Nmap output (.txt.tmp) and constructs a JSON object.
+    This function handles all parsing logic for detailed information.
+    """
+    try:
+        with open(nmap_output_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        report_data = {
+            "ip": ip,
+            "date": date_scan,
+            "network": network,
+            "os_info": "",
+            "open_ports": [],
+            "cves": [],
+            "http_info": [], # Now an array of objects
+            # REMOVIDO: ssh_info
+            # "ssh_info": {"host_keys": []},
+            "performance_latency_ms": 0.0
+        }
+
+        # 1. Parse OS Information
+        os_match = re.search(r"Running \((?:JUST GUESSING:)?\s*(.*?)\)|OS details: (.+)", content)
+        if os_match:
+            os_details = ""
+            if os_match.group(1): # Found by "Running ("
+                os_details = os_match.group(1).strip()
+            elif os_match.group(2): # Found by "OS details:"
+                os_details = os_match.group(2).strip()
+            report_data['os_info'] = re.sub(r'\.$', '', os_details)
+
+        # 2. Parse Open Ports and Full Service Versions
+        for match in re.finditer(
+            r"^(?P<port>\d+/(?:tcp|udp))\s+open\s+(?P<service>\S+)\s+(?P<version_full>.*?)(?=\n(?:\|\s|_|MAC Address:|OS details:|Aggressive OS guesses:|Service Info:|Nmap done:|Nmap scan report:|$))",
+            content, re.MULTILINE | re.DOTALL
+        ):
+            port_proto = match.group('port')
+            port = int(port_proto.split('/')[0])
+            protocol = port_proto.split('/')[1]
+            service = match.group('service')
+            version_full = match.group('version_full').strip()
+            
+            version_match = re.match(r'^([^\s\(]+)', version_full)
+            version = version_match.group(1) if version_match else version_full
+
+            report_data['open_ports'].append({
+                "port": port,
+                "protocol": protocol,
+                "service": service,
+                "version": version,
+                "service_version_full": version_full
+            })
+
+        # 3. Parse CVEs (from vulners script output)
+        for line in content.splitlines():
+            cve_pattern = r"(CVE-\d{4}-\d+|[A-Z0-9_.-]+):\s*([\d.]+)\s+(.+)"
+            match = re.search(cve_pattern, line)
+            
+            if match:
+                vuln_id = match.group(1)
+                cvss_str = match.group(2)
+                description_raw = match.group(3)
+
+                try:
+                    cvss = float(cvss_str)
+                except ValueError:
+                    cvss = 0.0
+
+                description = re.sub(r'https?://\S+|www\.\S+|\*EXPLOIT\*', '', description_raw).strip()
+                
+                if not any(item['id'] == vuln_id for item in report_data['cves']):
+                    report_data['cves'].append({
+                        "id": vuln_id,
+                        "cvss": cvss,
+                        "description": description
+                    })
+
+        # 4. Parse HTTP Info (per port)
+        http_service_blocks = re.findall(r"(\d+/(?:tcp|udp)\s+open\s+.*?(?:http|ssl/http).*\n(?:\|.*\n)*?)(?=(?:\n\d+/(?:tcp|udp)|Nmap done:|MAC Address:|OS details:|Aggressive OS guesses:|$))", content, re.MULTILINE | re.DOTALL)
+        
+        processed_http_ports = set()
+        for block in http_service_blocks:
+            port_match = re.search(r"^(\d+)/(?:tcp|udp)", block)
+            if port_match:
+                http_port_num = int(port_match.group(1))
+                if http_port_num in processed_http_ports:
+                    continue
+                processed_http_ports.add(http_port_num)
+
+                http_details = {"port": http_port_num}
+                
+                title_match = re.search(r"\|\_http-title:\s*(.*)", block)
+                if title_match:
+                    http_details["title"] = title_match.group(1).strip()
+
+                enum_paths = []
+                for path_match in re.finditer(r"\|\s*(/\S+)\s+\((\d{3})\)", block):
+                    enum_paths.append({"path": path_match.group(1), "status": path_match.group(2)})
+                
+                if not enum_paths:
+                    single_line_enum_match = re.search(r"\|\_http-enum:\s*(/\S+):\s*(.*)", block)
+                    if single_line_enum_match:
+                         enum_paths.append({"path": single_line_enum_match.group(1), "details": single_line_enum_match.group(2).strip()})
+
+                if enum_paths:
+                    http_details["enumerated_paths"] = enum_paths
+            
+                if http_details.get("title") or http_details.get("enumerated_paths"):
+                    report_data['http_info'].append(http_details)
+
+        # 5. REMOVIDO: Parse SSH Info (Host Keys)
+
+        # 6. Parse Performance Latency
+        latency_match = re.search(r"Host is up \((\d+\.?\d*s) latency\)", content)
+        if latency_match:
+            latency_str = latency_match.group(1).replace('s', '')
+            try:
+                report_data['performance_latency_ms'] = float(latency_str) * 1000
+            except ValueError:
+                pass
+
+        # Calculate risk score
+        report_data['risk_score'] = calculate_risk_score(report_data.get('cves', []))
+
+        # Output the generated JSON to a file
+        output_json_path = nmap_output_path.replace('.txt.tmp', '.json')
+        with open(output_json_path, 'w', encoding='utf-8') as json_f:
+            json.dump(report_data, json_f, indent=2)
+        
+        logger.info(f"Relatório JSON gerado: {output_json_path}")
+
+        return report_data
+
+    except Exception as e:
+        logger.error(f"Erro ao parsear arquivo Nmap ou gerar JSON para {nmap_output_path}: {str(e)}", exc_info=True)
+        return None
+
+def calculate_risk_score(cves: List[Dict[str, Any]]) -> float:
+    """Calcula o score de risco baseado no CVSS mais alto encontrado"""
+    if not cves:
+        return 0.0
+        
+    try:
+        max_cvss = max(float(cve.get('cvss', 0)) for cve in cves)
+        return min(max_cvss * 1.2, 10.0)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Erro ao calcular risk_score: {str(e)}")
+        return 0.0
+
+def import_report_to_tables(db_manager: DatabaseManager, data: Dict[str, Any], table_names: Dict[str, str]) -> bool:
+    """Importa um relatório para as tabelas especificadas"""
+    ip = data['ip']
+    scan_date = data['date']
+    network = data.get('network', '')
+    os_details = data.get('os_info', '')
+    performance_latency_ms = data.get('performance_latency_ms', 0.0)
+    
+    try:
+        cursor = db_manager.conn.cursor()
+        
+        risk_score = data.get('risk_score', 0.0) # Assume que risk_score já está no JSON
+        
+        # Insere host (ADICIONANDO OS_DETAILS E PERFORMANCE_LATENCY_MS)
+        cursor.execute(f'''
+            INSERT OR REPLACE INTO {table_names['hosts']} 
+            (ip, scan_date, network, risk_score, os_details, performance_latency_ms) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (ip, scan_date, network, risk_score, os_details, performance_latency_ms))
+        
+        # Insere portas (ADICIONANDO service_version_full)
+        for port_data in data.get('open_ports', []):
+            cursor.execute(f'''
+                INSERT OR IGNORE INTO {table_names['ports']} 
+                (host_ip, port, protocol, service, version, service_version_full) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                ip,
+                port_data.get('port'),
+                port_data.get('protocol', 'tcp'),
+                port_data.get('service', ''),
+                port_data.get('version', ''),
+                port_data.get('service_version_full', '')
+            ))
+        
+        # Insere vulnerabilidades
+        for cve in data.get('cves', []):
+            cve_id = cve.get('id')
+            if not cve_id:
+                continue
+                
+            cursor.execute(f'''
+                INSERT OR REPLACE INTO {table_names['vulns']} 
+                (id, host_ip, cvss, description) 
+                VALUES (?, ?, ?, ?)
+            ''', (
+                cve_id,
+                ip,
+                cve.get('cvss', 0.0),
+                cve.get('description', '')
+            ))
+        
+        # Insere recomendações padrão + baseadas nos dados do scan
+        recommendations = [
+            "Atualizar todos os serviços listados",
+            "Fechar portas não utilizadas",
+            "Implementar regras de firewall específicas"
+        ]
+        if os_details and ("Windows XP" in os_details or "Server 2003" in os_details):
+             recommendations.append("URGENTE: Descontinuar ou isolar sistemas operacionais legados (sem suporte).")
+        # Verificar http_info para títulos
+        for http_entry in data.get("http_info", []):
+            if "Apache Tomcat" in http_entry.get("title", "") or "Nginx" in http_entry.get("title", ""):
+                 recommendations.append(f"Verificar configurações padrão de servidores web Apache/Nginx/Tomcat na porta {http_entry['port']}.")
+            if "enumerated_paths" in http_entry:
+                for path_entry in http_entry["enumerated_paths"]:
+                    if "admin" in path_entry.get("path", ""):
+                         recommendations.append(f"Proteger painéis de administração web expostos (ex: {path_entry['path']}) na porta {http_entry['port']}.")
+        
+        # Deduplicar recomendações antes de inserir
+        unique_recommendations = list(set(recommendations))
+        for rec in unique_recommendations:
+            cursor.execute(f'''
+                INSERT OR IGNORE INTO {table_names['recom']} 
+                (host_ip, recommendation) 
+                VALUES (?, ?)
+            ''', (ip, rec))
+
+        # NOVO: Insere Detalhes HTTP
+        for http_entry in data.get('http_info', []):
+            port = http_entry.get('port')
+            title = http_entry.get('title', '')
+            if port is not None:
+                if 'enumerated_paths' in http_entry:
+                    for path_entry in http_entry['enumerated_paths']:
+                        cursor.execute(f'''
+                            INSERT OR REPLACE INTO {table_names['http_details']}
+                            (host_ip, port, title, path, status)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (
+                            ip,
+                            port,
+                            title,
+                            path_entry.get('path', ''),
+                            path_entry.get('status', '')
+                        ))
+                else: # Inserir apenas o título se não houver caminhos enumerados
+                    cursor.execute(f'''
+                        INSERT OR REPLACE INTO {table_names['http_details']}
+                        (host_ip, port, title)
+                        VALUES (?, ?, ?)
+                    ''', (ip, port, title))
+
+        # REMOVIDO: Insere Chaves SSH
+            
+        return True
+            
+    except sqlite3.Error as e:
+        logger.error(f"Erro SQL ao importar dados para {ip}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Erro inesperado ao importar dados para {ip}: {str(e)}")
+        return False
+
+def get_latest_reports_dir() -> Optional[str]:
+    """Encontra o diretório mais recente de relatórios"""
+    dirs = glob.glob('relatorios_scan_*')
+    if not dirs:
+        logger.error("Nenhum diretório de relatórios encontrado.")
+        return None
+        
+    latest_dir = max(dirs, key=os.path.getmtime)
+    logger.info(f"Usando diretório mais recente: {latest_dir}")
+    return latest_dir
+
+def process_reports(db_manager: DatabaseManager, directory: str) -> Tuple[bool, List[str]]:
+    """
+    Processa todos os arquivos brutos (.txt.tmp) em um diretório,
+    gera JSONs e os importa para o banco de dados.
+    """
+    if not os.path.isdir(directory):
+        logger.error(f"Diretório não encontrado: {directory}")
+        return False, []
+        
+    raw_nmap_outputs = glob.glob(os.path.join(directory, 'scan_*.txt.tmp'))
+    if not raw_nmap_outputs:
+        logger.warning(f"Nenhum arquivo de output bruto do Nmap (.txt.tmp) encontrado em {directory}. Por favor, execute o script Bash primeiro.")
+        return False, []
+
+    processed_count = 0
+    created_prefixes_list = []
+
+    for nmap_output_file in raw_nmap_outputs:
+        filename = os.path.basename(nmap_output_file)
+        
+        # Extrai IP e DATA_HORA do nome do arquivo para usar na geração do JSON
+        filename_parts = filename.split('_')
+        if len(filename_parts) >= 4:
+            ip = filename_parts[1].replace('_', '.')
+            date_time_part_raw = filename_parts[2] + "_" + filename_parts[3].split('.')[0]
+            
+            scan_date_iso = ""
+            try:
+                # Converte para um formato ISO (padrão) para o JSON
+                dt_obj = datetime.strptime(date_time_part_raw, "%Y%m%d_%H%M")
+                scan_date_iso = dt_obj.isoformat(timespec='minutes') 
+            except ValueError:
+                # Fallback se a data não estiver no formato esperado (pouco provável com seu script Bash)
+                scan_date_iso = date_time_part_raw 
+
+            # Tenta pegar a rede do nome do diretório ou usa o IP como fallback
+            network = directory.split('_')[-1] if len(directory.split('_')) > 2 else ip 
+            
+            logger.info(f"Gerando JSON a partir de output Nmap bruto: {filename}")
+            
+            # CHAMA A FUNÇÃO PYTHON PARA PARSEAR E GERAR O JSON
+            report_json_data = parse_nmap_output_to_json(nmap_output_file, ip, network, scan_date_iso)
+            
+            if report_json_data:
+                # Se o JSON foi gerado com sucesso, proceda para criar tabelas e importar
+                table_names = db_manager.create_scan_tables(report_json_data['date'], report_json_data['ip'])
+                if import_report_to_tables(db_manager, report_json_data, table_names):
+                    processed_count += 1
+                    created_prefixes_list.append(db_manager._format_date(report_json_data['date'], report_json_data['ip']))
+                    os.remove(nmap_output_file) # Remove o .txt.tmp após o processamento bem-sucedido
+                    logger.info(f"Arquivo temporário removido: {filename}")
+                else:
+                    logger.error(f"Falha ao importar dados do JSON para o banco de dados para {ip}. Verifique o log.")
+            else:
+                logger.error(f"Falha ao gerar JSON a partir do output Nmap bruto para {filename}. Verifique o log.")
+        else:
+            logger.warning(f"Nome de arquivo de output Nmap inesperado, pulando: {nmap_output_file}. Formato esperado: scan_<IP>_<YYYYMMDD>_<HHMM>.txt.tmp")
+
+    success = processed_count > 0
+    return success, sorted(list(set(created_prefixes_list)))
+
+
+def main():
+    try:
+        logger.info("Iniciando processamento de relatórios")
+        
+        with DatabaseManager() as db_manager:
+            if len(sys.argv) > 1:
+                directory = sys.argv[1]
+            else:
+                directory = get_latest_reports_dir()
+                if not directory:
+                    return 1
+                
+            success, created_prefixes = process_reports(db_manager, directory)
+            
+            # Saída simplificada
+            print("\nRadicais das tabelas criadas (scan_[DATA_IP]_*):")
+            if created_prefixes:
+                for prefix in created_prefixes:
+                    print(f"- {prefix}")
+                
+                print("\nExemplo de consulta:")
+                example = created_prefixes[0]
+                print(f"SELECT * FROM scan_{example}_hosts;")
+                print(f"SELECT * FROM scan_{example}_ports WHERE host_ip = '{example.split('_')[-1].replace('_','.')}';")
+                print(f"SELECT * FROM scan_{example}_vulns ORDER BY cvss DESC;")
+                print(f"SELECT * FROM scan_{example}_http_details WHERE host_ip = '{example.split('_')[-1].replace('_','.')}';")
+                # REMOVIDO: Exemplo de consulta para SSH keys
+                # print(f"SELECT * FROM scan_{example}_ssh_keys WHERE host_ip = '{example.split('_')[-1].replace('_','.')}';")
+            else:
+                print("Nenhuma tabela foi criada ou processada.")
+            
+            return 0 if success else 1
+            
+    except Exception as e:
+        logger.critical(f"Erro fatal no processador: {str(e)}", exc_info=True)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

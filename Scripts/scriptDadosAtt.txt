@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# Define a rede alvo. Se não for passada como argumento, tenta detectar.
+REDE=${1:-$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -n1)}
+DATA_HORA=$(date +"%Y%m%d_%H%M")
+DIR_RELATORIOS="relatorios_scan_$DATA_HORA"
+mkdir -p "$DIR_RELATORIOS"
+
+# Definição das cores para saída no terminal
+VERDE='\033[0;32m'
+VERMELHO='\033[0;31m'
+AZUL='\033[0;34m'
+AMARELO='\033[1;33m'
+NC='\033[0m'
+
+# Função para verificar e instalar dependências adicionais
+verify_additional_dependencies() {
+    echo -e "${AZUL}[*] Verificando dependências adicionais para análise aprofundada...${NC}"
+    
+    local NMAP_SCRIPT_DIR="/usr/share/nmap/scripts"
+
+    if [ ! -f "$NMAP_SCRIPT_DIR/http-title.nse" ]; then
+        echo -e "${AMARELO}[+] Baixando http-title.nse...${NC}"
+        sudo wget -q https://raw.githubusercontent.com/nmap/nmap/master/scripts/http-title.nse -O "$NMAP_SCRIPT_DIR/http-title.nse"
+    fi
+    if [ ! -f "$NMAP_SCRIPT_DIR/http-enum.nse" ]; then
+        echo -e "${AMARELO}[+] Baixando http-enum.nse...${NC}"
+        sudo wget -q https://raw.githubusercontent.com/nmap/nmap/master/scripts/http-enum.nse -O "$NMAP_SCRIPT_DIR/http-enum.nse"
+    fi
+    # REMOVIDO: ssh-hostkey.nse
+    # if [ ! -f "$NMAP_SCRIPT_DIR/ssh-hostkey.nse" ]; then
+    #     echo -e "${AMARELO}[+] Baixando ssh-hostkey.nse...${NC}"
+    #     sudo wget -q https://raw.githubusercontent.com/nmap/nmap/master/scripts/ssh-hostkey.nse -O "$NMAP_SCRIPT_DIR/ssh-hostkey.nse"
+    # fi
+
+    # Atualizar o banco de dados de scripts do Nmap após baixar novos
+    echo -e "${AZUL}[*] Atualizando banco de dados de scripts do Nmap...${NC}"
+    sudo nmap --script-updatedb
+}
+
+
+# Função para verificar e instalar dependências principais
+verify_dependencies() {
+    echo -e "${AZUL}[*] Verificando chave GPG...${NC}"
+
+    if ! apt-key list 2>/dev/null | grep -q "ED65462EC8D5E4C5"; then 
+        echo -e "${AMARELO}[+] Importando chave GPG para repositório Kali...${NC}"
+        curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/kali-archive-keyring.gpg > /dev/null
+    fi
+
+    echo -e "${AZUL}[*] Verificando dependências principais (nmap, wget, jq, python3)...${NC}"
+
+    for pkg in nmap wget jq python3; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            echo -e "${AMARELO}[+] Instalando $pkg...${NC}"
+            sudo apt update && sudo apt install -y "$pkg"
+        fi
+    done
+
+    if [ ! -f "/usr/share/nmap/scripts/vulners.nse" ]; then
+        echo -e "${AMARELO}[+] Instalando vulners.nse...${NC}"
+        sudo wget -q https://raw.githubusercontent.com/vulnersCom/nmap-vulners/master/vulners.nse -O /usr/share/nmap/scripts/vulners.nse
+    fi
+
+    verify_additional_dependencies
+
+    sudo nmap --script-updatedb
+}
+
+# generate_json_report() FOI COMPLETAMENTE REMOVIDA DESTE SCRIPT.
+# Toda a geração JSON será feita no Python.
+
+# Função para executar o scan em um IP
+scan_ip() {
+    local IP=$1
+    # O TMP_FILE agora é o principal arquivo de saída RAW do Nmap.
+    local TMP_FILE="$DIR_RELATORIOS/scan_${IP}_${DATA_HORA}.txt.tmp" 
+    local RELATORIO="$DIR_RELATORIOS/scan_${IP}_${DATA_HORA}.txt" # Relatório TXT para o usuário
+
+    # REMOVIDO: ssh-hostkey do NMAP_SCRIPTS
+    local NMAP_SCRIPTS="vulners,http-title,http-enum" 
+    local SCAN_CMD_ARRAY=(sudo nmap -sV -O --script "$NMAP_SCRIPTS" --script-args mincvss=5.0 -T4 --top-ports 1000 "$IP")
+
+    echo "=== RELATÓRIO DE VULNERABILIDADES ===" > "$RELATORIO"
+    echo "Data: $(date)" >> "$RELATORIO"
+    echo "Alvo: $IP" >> "$RELATORIO"
+    echo "Rede: $REDE" >> "$RELATORIO"
+
+    echo -e "${AZUL}[*] Executando scan em $IP...${NC}"
+    # Redireciona a saída bruta do Nmap para o TMP_FILE
+    "${SCAN_CMD_ARRAY[@]}" -oN "$TMP_FILE" 2>&1
+
+    # Lógica de scan completo mantida, a saída bruta também vai para o TMP_FILE
+    if grep -q -E "open.*(http|ssl|ssh|rdp|ftp|smtp)" "$TMP_FILE"; then
+        echo -e "${AZUL}[*] Serviços críticos detectados, scan completo...${NC}"
+        # Manter a mesma lista de scripts para consistência
+        local FULL_SCAN_CMD_ARRAY=(sudo nmap -sV -O --script "$NMAP_SCRIPTS" -p- --min-rate 5000 "$IP")
+        "${FULL_SCAN_CMD_ARRAY[@]}" -oN "$TMP_FILE.full" 2>&1
+        cat "$TMP_FILE.full" >> "$TMP_FILE"
+        rm -f "$TMP_FILE.full"
+    fi
+
+    # Gera APENAS o relatório TXT aqui
+    process_results "$IP" "$RELATORIO" "$TMP_FILE"
+    # O TMP_FILE NÃO É REMOVIDO AQUI, pois o Python precisará dele.
+}
+
+# Função para processar os resultados e gerar o relatório TXT.
+process_results() {
+    local IP=$1
+    local RELATORIO=$2
+    local TMP_FILE=$3 # Arquivo bruto do Nmap
+
+    echo -e "\n[PORTAS ABERTAS]" >> "$RELATORIO"
+    grep -E "[0-9]+/(tcp|udp).*open" "$TMP_FILE" | awk '{
+        port_proto=$1; service=$3;
+        version_info=""; for(i=4; i<=NF; i++) version_info = version_info " " $i;
+        print port_proto, service, version_info
+    }' >> "$RELATORIO"
+
+    echo -e "\n[SISTEMA OPERACIONAL DETECTADO]" >> "$RELATORIO"
+    OS_DETECTED_TXT=$(grep -E "^Running \(|OS details:" "$TMP_FILE" | head -n1 | sed -E 's/^\s*(Running \([^\)]+\):\s*|OS details:\s*)?//; s/\.$//')
+    if [ -n "$OS_DETECTED_TXT" ]; then
+        echo "$OS_DETECTED_TXT" >> "$RELATORIO"
+    else
+        echo "Nenhum sistema operacional detalhado detectado." >> "$RELATORIO"
+    fi
+
+    echo -e "\n[CVEs ENCONTRADOS]" >> "$RELATORIO"
+    # Pegar as linhas de CVE sem o prefixo do Nmap para o TXT
+    if grep -q -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE"; then
+        grep -E "CVE-[0-9]{4}-[0-9]+" "$TMP_FILE" | sed -E 's/^\s*\|\s*//' | sort | uniq >> "$RELATORIO"
+    else
+        echo "Nenhum CVE crítico encontrado (CVSS >= 5.0)." >> "$RELATORIO"
+    fi
+
+    echo -e "\n[INFORMAÇÕES HTTP]" >> "$RELATORIO"
+    local HTTP_INFO_SECTION_FOUND=0
+    local HTTP_PORTS=$(grep -E "^[0-9]+/(tcp|udp)[[:space:]]+open.*http" "$TMP_FILE" | awk '{print $1}')
+    if [ -n "$HTTP_PORTS" ]; then
+        for p in $HTTP_PORTS; do
+            local PORT_NUM=$(echo "$p" | cut -d'/' -f1)
+            echo "Porta ${PORT_NUM}:" >> "$RELATORIO"
+            
+            local CURRENT_PORT_HTTP_TITLE_TXT=$(grep -A5 "${PORT_NUM}/tcp" "$TMP_FILE" | grep -E "^\s*\|\_http-title:" | head -n1 | sed -E 's/^\s*\|\_http-title:\s*//')
+            if [ -n "$CURRENT_PORT_HTTP_TITLE_TXT" ]; then
+                echo "   Título da Página: $CURRENT_PORT_HTTP_TITLE_TXT" >> "$RELATORIO"
+                HTTP_INFO_SECTION_FOUND=1
+            fi
+            
+            local CURRENT_PORT_HTTP_ENUM_TXT=$(grep -A20 "${PORT_NUM}/tcp" "$TMP_FILE" | grep -E "^\s*\|\_http-enum:" | sed -E 's/^\s*\|\_http-enum:\s*//; s/^\s*\|\s*//')
+            if [ -n "$CURRENT_PORT_HTTP_ENUM_TXT" ]; then
+                echo "   Caminhos Enumerados:" >> "$RELATORIO"
+                echo "$CURRENT_PORT_HTTP_ENUM_TXT" | sed 's/^/    /' >> "$RELATORIO"
+                HTTP_INFO_SECTION_FOUND=1
+            fi
+        done
+    fi
+    if [ "$HTTP_INFO_SECTION_FOUND" -eq 0 ]; then
+        echo "Nenhuma informação HTTP detalhada encontrada." >> "$RELATORIO"
+    fi
+
+    # REMOVIDO: Sessão de informações SSH do TXT
+    # echo -e "\n[INFORMAÇÕES SSH]" >> "$RELATORIO"
+    # echo "Nenhuma informação SSH detalhada encontrada." >> "$RELATORIO"
+
+    echo -e "\n[INFORMAÇÕES DE DESEMPENHO]" >> "$RELATORIO"
+    LATENCY_TXT=$(grep -E "Host is up \(.*\)" "$TMP_FILE" | head -n1 | sed -E 's/.*latency ([0-9.]+s).*$/Latência Média: \1/')
+    if [ -n "$LATENCY_TXT" ]; then
+        echo "$LATENCY_TXT" >> "$RELATORIO"
+    else
+        echo "Informações de latência não disponíveis no log detalhado." >> "$RELATORIO"
+    fi
+
+    generate_recommendations "$RELATORIO" "$TMP_FILE"
+    echo -e "${VERDE}[+] Relatório TXT salvo: $RELATORIO${NC}"
+}
+
+generate_recommendations() {
+    local RELATORIO=$1
+    local TMP_FILE=$2
+
+    echo -e "\n[RECOMENDAÇÕES]" >> "$RELATORIO"
+
+    grep -q "open.*http" "$TMP_FILE" && echo "- [HTTP] Verificar headers de segurança e atualizar servidor web" >> "$RELATORIO"
+    grep -q "open.*ssl" "$TMP_FILE" && echo "- [SSL] Verificar certificados e desativar protocolos inseguros (SSLv2/SSLv3)" >> "$RELATORIO"
+    grep -q "open.*ssh" "$TMP_FILE" && echo "- [SSH] Desativar login root e usar autenticação por chaves" >> "$RELATORIO"
+    grep -q "open.*msrpc" "$TMP_FILE" && echo "- [MSRPC] Restringir acesso via firewall e verificar atualizações" >> "$RELATORIO"
+    grep -q "open.*ftp" "$TMP_FILE" && echo "- [FTP] Desativar FTP não criptografado (usar SFTP/FTPS)" >> "$RELATORIO"
+
+    if grep -q "OS details:" "$TMP_FILE" && (grep "Windows XP" "$TMP_FILE" || grep "Server 2003" "$TMP_FILE"); then
+        echo "- [SISTEMA OPERACIONAL] URGENTE: Descontinuar ou isolar sistemas operacionais legados (sem suporte)." >> "$RELATORIO"
+    fi
+    if grep -q "\|\_http-title: Apache Tomcat/" "$TMP_FILE" || grep -q "\|\_http-title: Nginx/" "$TMP_FILE"; then
+        echo "- [WEB SERVER] Verificar configurações padrão de servidores web como Apache/Nginx/Tomcat." >> "$RELATORIO"
+    fi
+    if grep -q "\|\_http-enum:" "$TMP_FILE" && grep -q "/admin" "$TMP_FILE"; then
+        echo "- [WEB ADMIN] Proteger painéis de administração web expostos (ex: /admin)." >> "$RELATORIO"
+    fi
+
+    echo "- Atualizar todos os serviços listados" >> "$RELATORIO"
+    echo "- Fechar portas não utilizadas" >> "$RELATORIO"
+    echo "- Implementar regras de firewall específicas" >> "$RELATORIO"
+    echo "- Monitorar logs de acesso aos serviços expostos" >> "$RELATORIO"
+}
+
+clear
+echo -e "${VERDE}==== KALI LINUX VULNERABILITY SCANNER ====${NC}"
+echo -e "Rede detectada: ${VERMELHO}$REDE${NC}"
+echo -e "Data da análise: ${VERMELHO}$(date)${NC}"
+
+verify_dependencies
+
+HOSTS_ATIVOS=$(sudo nmap -sn "$REDE" -oG - | awk '/Up$/{print $2}')
+echo -e "${VERDE}[+] Hosts ativos encontrados:${NC}"
+echo "$HOSTS_ATIVOS"
+
+for ip in $HOSTS_ATIVOS; do
+    scan_ip "$ip"
+done
+
+echo -e "\n${VERDE}[+] Análise concluída!${NC}"
+echo -e "Relatórios salvos em: ${VERMELHO}$DIR_RELATORIOS/${NC}"
+# Instrução para o processador Python agora apontará para o diretório
+# para que ele encontre os arquivos .txt.tmp e os processe em JSON.
+echo -e "Para processar os dados para o dashboard: ${AMARELO}python3 processor.py $DIR_RELATORIOS${NC}"
+echo -e "Para excluir todos os relatórios: ${VERMELHO}rm -rf $DIR_RELATORIOS${NC}"
