@@ -365,10 +365,7 @@ def main():
                 example = created_prefixes[0]
                 print(f"SELECT * FROM scan_{example}_hosts;")
                 print(f"SELECT * FROM scan_{example}_vulns ORDER BY cvss DESC;")
-                
-            print("\nPara usar no Metabase, a tabela 'scan_history' agora contém todos os prefixos de scan.")
-            print("Crie um filtro de dashboard vinculado à 'scan_history.prefix_id' para dashboards dinâmicos.")
-            
+                            
             return 0 if success else 1
             
     except Exception as e:
