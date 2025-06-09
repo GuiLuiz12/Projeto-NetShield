@@ -1,0 +1,16 @@
+-- CONSULTA ATUALIZADA: Lista de CVEs Encontrados
+SELECT
+    v.host_ip,
+    v.id AS cve_id,
+    v.cvss,
+    v.description
+FROM
+    scan_history sh
+JOIN
+    (
+        -- ▼▼ ÁREA DE MANUTENÇÃO ATUALIZADA COM TODOS OS SCANS ▼▼
+        SELECT host_ip, id, cvss, description, '250609_172_16_43_45'   AS scan_prefix FROM "scan_250609_172_16_43_45_vulns"   UNION ALL
+        SELECT host_ip, id, cvss, description, '250609_172_16_43_65'   AS scan_prefix FROM "scan_250609_172_16_43_65_vulns"   UNION ALL
+    ) AS v ON sh.prefix_id = v.scan_prefix
+WHERE {{data_scan}} AND v.cvss > 0
+ORDER BY v.cvss DESC;

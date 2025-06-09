@@ -6,7 +6,7 @@ import os
 import logging
 import sys
 import re
-from typing import Optional, Dict, List, Any, Tuple  # Adicionando Tuple aqui
+from typing import Optional, Dict, List, Any, Tuple
 
 # Configuração de logging
 logging.basicConfig(
@@ -29,6 +29,7 @@ class DatabaseManager:
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_name)
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.create_scan_history_table() # Chama a criação da tabela de histórico no __enter__
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -44,7 +45,7 @@ class DatabaseManager:
         try:
             dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
             date_part = dt.strftime("%y%m%d")  # Formato: YYMMDD
-            ip_part = ip.replace('.', '_')     # Formato: 192_168_1_1
+            ip_part = ip.replace('.', '_')      # Formato: 192_168_1_1
             return f"{date_part}_{ip_part}"
         except:
             # Fallback seguro
@@ -133,7 +134,34 @@ class DatabaseManager:
             logger.error(f"Erro ao criar tabelas: {str(e)}")
             raise
 
-# ... (restante do código permanece igual) ...
+    # --- INÍCIO DAS NOVAS FUNÇÕES PARA O HISTÓRICO DE SCANS ---
+    def create_scan_history_table(self):
+        """Cria a tabela para registrar os históricos de scans."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scan_history (
+                prefix_id TEXT PRIMARY KEY,
+                scan_date TEXT NOT NULL,
+                network TEXT,
+                ip_alvo TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        logger.info("Tabela 'scan_history' verificada/criada.")
+
+    def record_scan_history(self, prefix_id: str, scan_date: str, network: str, ip_alvo: str):
+        """Registra um scan na tabela de histórico."""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO scan_history (prefix_id, scan_date, network, ip_alvo)
+                VALUES (?, ?, ?, ?)
+            ''', (prefix_id, scan_date, network, ip_alvo))
+            logger.info(f"Scan '{prefix_id}' registrado no histórico.")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao registrar scan no histórico: {str(e)}")
+    # --- FIM DAS NOVAS FUNÇÕES ---
+
 
 def get_latest_reports_dir() -> Optional[str]:
     """Encontra o diretório mais recente de relatórios"""
@@ -299,10 +327,13 @@ def process_reports(db_manager: DatabaseManager, directory: str) -> Tuple[bool, 
         if not data:
             continue
             
+        table_prefix = db_manager._format_date(data['date'], data['ip']) # Garante que o prefixo seja gerado corretamente
         table_names = db_manager.create_scan_tables(data['date'], data['ip'])
         
         if import_report_to_tables(db_manager, data, table_names):
             imported += 1
+            # NOVO: Registra o scan no histórico
+            db_manager.record_scan_history(table_prefix, data['date'], data.get('network', ''), data['ip'])
     
     success = imported > 0
     created_prefixes = sorted(db_manager.table_prefixes)
@@ -334,6 +365,9 @@ def main():
                 example = created_prefixes[0]
                 print(f"SELECT * FROM scan_{example}_hosts;")
                 print(f"SELECT * FROM scan_{example}_vulns ORDER BY cvss DESC;")
+                
+            print("\nPara usar no Metabase, a tabela 'scan_history' agora contém todos os prefixos de scan.")
+            print("Crie um filtro de dashboard vinculado à 'scan_history.prefix_id' para dashboards dinâmicos.")
             
             return 0 if success else 1
             
