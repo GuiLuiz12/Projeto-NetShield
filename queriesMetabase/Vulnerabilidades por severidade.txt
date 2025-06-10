@@ -1,20 +1,23 @@
--- CONSULTA ATUALIZADA: Contagem de Vulnerabilidades por Severidade (CVSS)
+-- Vulnerabilidades por Severidade (com ordenação correta)
 SELECT
     CASE
-        WHEN v.cvss >= 9.0 THEN 'Crítico (9.0+)'
-        WHEN v.cvss >= 7.0 THEN 'Alto (7.0-8.9)'
-        WHEN v.cvss >= 4.0 THEN 'Médio (4.0-6.9)'
+        WHEN cvss >= 9.0 THEN 'Crítico (9.0+)'
+        WHEN cvss >= 7.0 THEN 'Alto (7.0-8.9)'
+        WHEN cvss >= 4.0 THEN 'Médio (4.0-6.9)'
         ELSE 'Baixo (0-3.9)'
     END AS severidade,
     COUNT(*) AS total
 FROM
-    scan_history sh
-JOIN
-    (
-        -- ▼▼ ÁREA DE MANUTENÇÃO ATUALIZADA COM TODOS OS SCANS ▼▼
-        SELECT cvss, '250609_172_16_43_45'   AS scan_prefix FROM "scan_250609_172_16_43_45_vulns"   UNION ALL
-        SELECT cvss, '250609_172_16_43_65'   AS scan_prefix FROM "scan_250609_172_16_43_65_vulns"   UNION ALL
-    ) AS v ON sh.prefix_id = v.scan_prefix
-WHERE {{data_scan}}
-GROUP BY severidade
-ORDER BY CASE WHEN severidade = 'Crítico (9.0+)' THEN 1 WHEN severidade = 'Alto (7.0-8.9)' THEN 2 WHEN severidade = 'Médio (4.0-6.9)' THEN 3 WHEN severidade = 'Baixo (0-3.9)' THEN 4 ELSE 5 END;
+    vulnerabilities
+WHERE
+    scan_id = {{session_id}}
+GROUP BY
+    severidade
+ORDER BY
+    CASE
+        WHEN severidade = 'Crítico (9.0+)' THEN 1
+        WHEN severidade = 'Alto (7.0-8.9)' THEN 2
+        WHEN severidade = 'Médio (4.0-6.9)' THEN 3
+        WHEN severidade = 'Baixo (0-3.9)' THEN 4
+        ELSE 5
+    END;

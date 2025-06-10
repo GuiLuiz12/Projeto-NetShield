@@ -1,15 +1,11 @@
--- CONSULTA ATUALIZADA: Top 10 Hosts por Risco
+-- Top 10 Hosts por Risco
 SELECT
-    h.ip,
-    h.risk_score
+    ip,
+    risk_score
 FROM
-    scan_history sh
-JOIN
-    (
-        -- ▼▼ ÁREA DE MANUTENÇÃO ATUALIZADA COM TODOS OS SCANS ▼▼
-        SELECT ip, risk_score, '250609_172_16_43_45'   AS scan_prefix FROM "scan_250609_172_16_43_45_hosts"   UNION ALL
-        SELECT ip, risk_score, '250609_172_16_43_65'   AS scan_prefix FROM "scan_250609_172_16_43_65_hosts"   UNION ALL
-       
-    ) AS h ON sh.prefix_id = h.scan_prefix
-WHERE {{data_scan}}
-ORDER BY h.risk_score DESC;
+    hosts
+WHERE
+    scan_id = {{session_id}}
+ORDER BY
+    risk_score DESC
+LIMIT 10;
